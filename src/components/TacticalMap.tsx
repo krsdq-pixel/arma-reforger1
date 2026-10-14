@@ -1,12 +1,12 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
+import L from 'leaflet';
 import {
   Coordinates,
   CalculationResult,
   Language,
   InteractionMode,
   Landmark,
-  TacticalDrawing,
-  MapDiagnosticInfo
+  TacticalDrawing
 } from '../types/mortar';
 import { MapData } from '../data/mapsData';
 import { meterToGrid4 } from '../utils/ballistics';
@@ -29,6 +29,39 @@ interface TacticalMapProps {
   maxRange: number;
 }
 
+// Enfusion Engine Coordinate Reference System for Leaflet
+const ENFUSION_SCALE_CONSTANT = 12.501;
+
+const EnfusionCRS = L.Util.extend({}, L.CRS.Simple, {
+  projection: L.Projection.LonLat,
+  transformation: new L.Transformation(1 / ENFUSION_SCALE_CONSTANT, 0, -1 / ENFUSION_SCALE_CONSTANT, 0),
+  scale(zoom: number) {
+    return Math.pow(2, zoom);
+  },
+  zoom(scale: number) {
+    return Math.log(scale) / Math.LN2;
+  },
+  distance(p1: L.LatLng, p2: L.LatLng) {
+    const dx = p2.lng - p1.lng;
+    const dy = p2.lat - p1.lat;
+    return Math.sqrt(dx * dx + dy * dy);
+  },
+  infinite: true
+}) as L.CRS;
+
+// Custom TileLayer to handle EnfusionMapMaker inverted Y tile coordinates
+class EnfusionTileLayer extends L.TileLayer {
+  getTileUrl(coords: L.Coords): string {
+    const invertedY = -(coords.y + 1);
+    const tileCoords = {
+      x: coords.x,
+      y: invertedY,
+      z: coords.z
+    };
+    return super.getTileUrl(tileCoords as unknown as L.Coords);
+  }
+}
+
 export const TacticalMap: React.FC<TacticalMapProps> = ({
   mapData,
   mortar,
@@ -46,111 +79,46 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
   maxRange
 }) => {
   const t = translations[lang];
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mapContainerRef = useRef<HTMLDivElement | null>(null);
+  const leafletMapRef = useRef<L.Map | null>(null);
+  const tileLayerRef = useRef<EnfusionTileLayer | null>(null);
 
-  // Viewport transformation: pan and zoom
-  const [zoom, setZoom] = useState<number>(0.05); // scale (pixels per meter)
-  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [dragTarget, setDragTarget] = useState<'mortar' | 'target' | 'viewport' | null>(null);
+  // Layers refs
+  const gridLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const landmarksLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const drawingsLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const trajectoryLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const rulerLayerGroupRef = useRef<L.LayerGroup | null>(null);
+
+  // Markers refs
+  const mortarMarkerRef = useRef<L.Marker | null>(null);
+  const targetMarkerRef = useRef<L.Marker | null>(null);
+
+  // Map Tile Loading State & Diagnostics
+  const [tileLoadingStatus, setTileLoadingStatus] = useState<'idle' | 'loading' | 'loaded' | 'error'>('loading');
+  const [tilesLoadedCount, setTilesLoadedCount] = useState<number>(0);
+  const [tilesErrorCount, setTilesErrorCount] = useState<number>(0);
+  const [lastErrorMessage, setLastErrorMessage] = useState<string | null>(null);
+  const [currentZoom, setCurrentZoom] = useState<number>(0);
+  const [showDiagnostics, setShowDiagnostics] = useState<boolean>(false);
+
+  // Cursor coordinates
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
 
-  // Map Imagery Loading State (TASK 1 & TASK 2)
-  const [mapImage, setMapImage] = useState<HTMLImageElement | null>(null);
-  const [imageLoadingStatus, setImageLoadingStatus] = useState<'idle' | 'loading' | 'loaded' | 'error'>('loading');
-  const [imageErrorMessage, setImageErrorMessage] = useState<string | null>(null);
-  const [retryCounter, setRetryCounter] = useState(0);
-
-  // Diagnostics modal/drawer toggle (TASK 6)
-  const [showDiagnostics, setShowDiagnostics] = useState(false);
-
-  // Ruler measurement tool state
-  const [measureStart, setMeasureStart] = useState<{ x: number; y: number } | null>(null);
-  const [measureEnd, setMeasureEnd] = useState<{ x: number; y: number } | null>(null);
+  // Measurement tool state
+  const [measurePointA, setMeasurePointA] = useState<{ x: number; y: number } | null>(null);
+  const [measurePointB, setMeasurePointB] = useState<{ x: number; y: number } | null>(null);
 
   // Active in-progress drawing
   const [drawingStart, setDrawingStart] = useState<{ x: number; y: number } | null>(null);
-  const [drawingCurrent, setDrawingCurrent] = useState<{ x: number; y: number } | null>(null);
   const [drawingColor, setDrawingColor] = useState<string>('#ef4444');
 
   // Display toggles
-  const [showGrid, setShowGrid] = useState(true);
-  const [showLabels, setShowLabels] = useState(true);
-  const [showRings, setShowRings] = useState(true);
+  const [showGrid, setShowGrid] = useState<boolean>(true);
+  const [showLabels, setShowLabels] = useState<boolean>(true);
+  const [showRings, setShowRings] = useState<boolean>(true);
 
-  // Touch tracking for mobile (TASK 5)
-  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
-  const touchPinchDistRef = useRef<number | null>(null);
-
-  // Load Real Authentic Map Image (TASK 1 & 2)
-  useEffect(() => {
-    let isCancelled = false;
-    setImageLoadingStatus('loading');
-    setImageErrorMessage(null);
-
-    const img = new Image();
-    // Do not set crossOrigin to avoid CORS tainted canvas when drawing plain images
-    img.src = mapData.overviewUrl;
-
-    img.onload = () => {
-      if (isCancelled) return;
-      setMapImage(img);
-      setImageLoadingStatus('loaded');
-      setImageErrorMessage(null);
-    };
-
-    img.onerror = () => {
-      if (isCancelled) return;
-      setMapImage(null);
-      setImageLoadingStatus('error');
-      setImageErrorMessage(`Could not load map image from ${mapData.overviewUrl}. External server may be unreachable.`);
-    };
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [mapData.overviewUrl, retryCounter]);
-
-  // Fit map on initial load or map change
-  const fitMap = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    const scale = Math.min(width, height) / (mapData.size * 1.05);
-    setZoom(scale);
-    // Center the map in canvas
-    const centerX = width / 2;
-    const centerY = height / 2;
-    setPan({
-      x: centerX - (mapData.size / 2) * scale,
-      y: centerY - (mapData.size / 2) * scale
-    });
-  }, [mapData.size]);
-
-  useEffect(() => {
-    fitMap();
-  }, [fitMap]);
-
-  // Coordinate Conversion: Screen to Map coordinates
-  const screenToMap = useCallback((screenX: number, screenY: number) => {
-    const mapX = (screenX - pan.x) / zoom;
-    const mapY = mapData.size - ((screenY - pan.y) / zoom);
-    return {
-      x: Math.max(0, Math.min(mapData.size, mapX)),
-      y: Math.max(0, Math.min(mapData.size, mapY))
-    };
-  }, [pan, zoom, mapData.size]);
-
-  // Map to Screen coordinates
-  const mapToScreen = useCallback((mapX: number, mapY: number) => {
-    const screenX = pan.x + mapX * zoom;
-    const screenY = pan.y + (mapData.size - mapY) * zoom;
-    return { x: screenX, y: screenY };
-  }, [pan, zoom, mapData.size]);
-
-  // Nearest landmark elevation
+  // Elevation calculation helper
   const getGroundElevation = useCallback((x: number, y: number) => {
     let nearest: Landmark | null = null;
     let minDist = Infinity;
@@ -168,742 +136,565 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
     return 30; // Default elevation
   }, [mapData.landmarks]);
 
-  // Main Canvas Render Loop
+  // 1. Initialize Leaflet Map on Mount
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    if (!mapContainerRef.current) return;
 
-    // High DPI scaling
-    const dpr = window.devicePixelRatio || 1;
-    const displayWidth = canvas.clientWidth;
-    const displayHeight = canvas.clientHeight;
+    // Map bounds in Enfusion coordinate space: [0, 0] to [size, size]
+    // In LonLat CRS: lat = Northing (Y), lng = Easting (X)
+    const southWest = L.latLng(0, 0);
+    const northEast = L.latLng(mapData.size, mapData.size);
+    const bounds = L.latLngBounds(southWest, northEast);
 
-    if (canvas.width !== displayWidth * dpr || canvas.height !== displayHeight * dpr) {
-      canvas.width = displayWidth * dpr;
-      canvas.height = displayHeight * dpr;
+    const map = L.map(mapContainerRef.current, {
+      crs: EnfusionCRS,
+      center: bounds.getCenter(),
+      zoom: 0,
+      minZoom: 0,
+      maxZoom: mapData.maxZoomLOD || 5,
+      maxBounds: bounds.pad(0.3),
+      maxBoundsViscosity: 0.8,
+      zoomControl: false,
+      attributionControl: false,
+      bounceAtZoomLimits: false
+    });
+
+    leafletMapRef.current = map;
+
+    // Layer groups
+    gridLayerGroupRef.current = L.layerGroup().addTo(map);
+    landmarksLayerGroupRef.current = L.layerGroup().addTo(map);
+    drawingsLayerGroupRef.current = L.layerGroup().addTo(map);
+    trajectoryLayerGroupRef.current = L.layerGroup().addTo(map);
+    rulerLayerGroupRef.current = L.layerGroup().addTo(map);
+
+    // Initial view
+    map.fitBounds(bounds);
+    setCurrentZoom(map.getZoom());
+
+    map.on('zoomend', () => {
+      setCurrentZoom(map.getZoom());
+    });
+
+    map.on('mousemove', (e: L.LeafletMouseEvent) => {
+      const x = Math.max(0, Math.min(mapData.size, e.latlng.lng));
+      const y = Math.max(0, Math.min(mapData.size, e.latlng.lat));
+      setCursorPos({ x, y });
+    });
+
+    return () => {
+      map.remove();
+      leafletMapRef.current = null;
+    };
+  }, [mapData.id, mapData.size, mapData.maxZoomLOD]);
+
+  // 2. Load Multi-Level Real Map Tiles
+  useEffect(() => {
+    const map = leafletMapRef.current;
+    if (!map) return;
+
+    // Remove existing tile layer if any
+    if (tileLayerRef.current) {
+      map.removeLayer(tileLayerRef.current);
+      tileLayerRef.current = null;
     }
 
-    ctx.save();
-    ctx.scale(dpr, dpr);
+    setTileLoadingStatus('loading');
+    setTilesLoadedCount(0);
+    setTilesErrorCount(0);
+    setLastErrorMessage(null);
 
-    // 1. Clear background
-    ctx.fillStyle = '#090d13';
-    ctx.fillRect(0, 0, displayWidth, displayHeight);
+    const southWest = L.latLng(0, 0);
+    const northEast = L.latLng(mapData.size, mapData.size);
+    const bounds = L.latLngBounds(southWest, northEast);
 
-    // 2. Real Map Image Rendering (TASK 1 & TASK 2)
-    // Map bounding box in screen coordinates
-    const tl = mapToScreen(0, mapData.size);
-    const br = mapToScreen(mapData.size, 0);
-    const mapRenderWidth = br.x - tl.x;
-    const mapRenderHeight = br.y - tl.y;
+    const maxZoom = mapData.maxZoomLOD || 5;
 
-    if (imageLoadingStatus === 'loaded' && mapImage) {
-      try {
-        // Draw real authentic terrain image aligned to coordinate space
-        ctx.drawImage(mapImage, tl.x, tl.y, mapRenderWidth, mapRenderHeight);
-      } catch {
-        // In case of render exception
-      }
-    } else {
-      // While loading or if error, render a clear muted backdrop with loading message
-      ctx.fillStyle = '#121921';
-      ctx.fillRect(tl.x, tl.y, mapRenderWidth, mapRenderHeight);
-      ctx.strokeStyle = '#273544';
-      ctx.strokeRect(tl.x, tl.y, mapRenderWidth, mapRenderHeight);
-    }
+    // Real multi-level EnfusionMapMaker tile layer
+    const tileLayer = new EnfusionTileLayer(mapData.tileTemplateUrl, {
+      maxZoom: maxZoom,
+      minZoom: 0,
+      // Invert zoom so Leaflet zoom 0 maps to LOD 5 (overview), and Leaflet zoom 5 maps to LOD 0 (high detail)
+      zoomReverse: true,
+      bounds: bounds,
+      tileSize: 256,
+      keepBuffer: 6
+    });
 
-    // Map border outline
-    ctx.strokeStyle = 'rgba(74, 222, 128, 0.4)';
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(tl.x, tl.y, mapRenderWidth, mapRenderHeight);
+    tileLayer.on('tileloadstart', () => {
+      setTileLoadingStatus('loading');
+    });
 
-    // 3. Tactical Military Grid (1000m Major Grid + 100m Minor Grid)
-    if (showGrid) {
-      const step1000 = 1000;
-      const step100 = 100;
+    tileLayer.on('tileload', () => {
+      setTilesLoadedCount(c => c + 1);
+      setTileLoadingStatus('loaded');
+    });
 
-      // Minor 100m lines when zoomed in
-      if (zoom >= 0.08) {
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
-        ctx.lineWidth = 0.5;
-        ctx.beginPath();
-        for (let m = 0; m <= mapData.size; m += step100) {
-          if (m % 1000 === 0) continue;
-          const p1 = mapToScreen(m, 0);
-          const p2 = mapToScreen(m, mapData.size);
-          ctx.moveTo(p1.x, p1.y);
-          ctx.lineTo(p2.x, p2.y);
+    tileLayer.on('tileerror', (e) => {
+      setTilesErrorCount(c => c + 1);
+      const target = e.tile as HTMLImageElement;
+      setLastErrorMessage(`Failed loading tile: ${target.src}`);
+      // If majority of tiles fail, mark error state
+      setTileLoadingStatus('error');
+    });
 
-          const q1 = mapToScreen(0, m);
-          const q2 = mapToScreen(mapData.size, m);
-          ctx.moveTo(q1.x, q1.y);
-          ctx.lineTo(q2.x, q2.y);
+    tileLayer.addTo(map);
+    tileLayerRef.current = tileLayer;
+
+    // Fit map bounds
+    map.fitBounds(bounds);
+  }, [mapData.id, mapData.tileTemplateUrl, mapData.size, mapData.maxZoomLOD]);
+
+  // 3. Map Click & Interaction Handling
+  useEffect(() => {
+    const map = leafletMapRef.current;
+    if (!map) return;
+
+    const handleClick = (e: L.LeafletMouseEvent) => {
+      const x = Math.max(0, Math.min(mapData.size, e.latlng.lng));
+      const y = Math.max(0, Math.min(mapData.size, e.latlng.lat));
+      const alt = getGroundElevation(x, y);
+
+      if (interactionMode === 'mortar') {
+        onSetMortar({ x, y, alt });
+      } else if (interactionMode === 'target') {
+        onSetTarget({ x, y, alt });
+      } else if (interactionMode === 'measure') {
+        if (!measurePointA) {
+          setMeasurePointA({ x, y });
+          setMeasurePointB({ x, y });
+        } else {
+          setMeasurePointB({ x, y });
         }
-        ctx.stroke();
-      }
-
-      // Major 1000m (1km) grid lines
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      for (let m = 0; m <= mapData.size; m += step1000) {
-        const p1 = mapToScreen(m, 0);
-        const p2 = mapToScreen(m, mapData.size);
-        ctx.moveTo(p1.x, p1.y);
-        ctx.lineTo(p2.x, p2.y);
-
-        const q1 = mapToScreen(0, m);
-        const q2 = mapToScreen(mapData.size, m);
-        ctx.moveTo(q1.x, q1.y);
-        ctx.lineTo(q2.x, q2.y);
-      }
-      ctx.stroke();
-
-      // Grid index labels (e.g. "04", "05", "11")
-      ctx.font = '10px "JetBrains Mono", monospace';
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
-      for (let m = 0; m <= mapData.size; m += step1000) {
-        const gridIndex = String(Math.floor(m / 1000)).padStart(2, '0');
-        const posBottom = mapToScreen(m + 40, 50);
-        const posLeft = mapToScreen(50, m + 40);
-
-        if (posBottom.x >= 0 && posBottom.x <= displayWidth && posBottom.y >= 0 && posBottom.y <= displayHeight) {
-          ctx.fillText(gridIndex, posBottom.x, posBottom.y);
+      } else if (interactionMode === 'draw_line') {
+        if (!drawingStart) {
+          setDrawingStart({ x, y });
+        } else {
+          onAddDrawing({
+            id: Math.random().toString(36).substring(2, 9),
+            mapId: mapData.id,
+            type: 'line',
+            color: drawingColor,
+            points: [[drawingStart.x, drawingStart.y], [x, y]],
+            timestamp: Date.now()
+          });
+          setDrawingStart(null);
         }
-        if (posLeft.x >= 0 && posLeft.x <= displayWidth && posLeft.y >= 0 && posLeft.y <= displayHeight) {
-          ctx.fillText(gridIndex, posLeft.x, posLeft.y);
-        }
-      }
-    }
-
-    // 4. Saved Tactical Drawings (TASK 4)
-    if (drawings && drawings.length > 0) {
-      drawings.forEach(d => {
-        if (d.mapId !== mapData.id) return;
-        ctx.save();
-        ctx.strokeStyle = d.color;
-        ctx.fillStyle = d.color;
-        ctx.lineWidth = 2;
-
-        if (d.type === 'line' && d.points.length >= 2) {
-          ctx.beginPath();
-          const p0 = mapToScreen(d.points[0][0], d.points[0][1]);
-          ctx.moveTo(p0.x, p0.y);
-          for (let i = 1; i < d.points.length; i++) {
-            const pt = mapToScreen(d.points[i][0], d.points[i][1]);
-            ctx.lineTo(pt.x, pt.y);
-          }
-          ctx.stroke();
-
-          // Arrowhead
-          if (d.points.length === 2) {
-            const p1 = mapToScreen(d.points[1][0], d.points[1][1]);
-            const angle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
-            ctx.beginPath();
-            ctx.moveTo(p1.x, p1.y);
-            ctx.lineTo(p1.x - 10 * Math.cos(angle - Math.PI / 6), p1.y - 10 * Math.sin(angle - Math.PI / 6));
-            ctx.lineTo(p1.x - 10 * Math.cos(angle + Math.PI / 6), p1.y - 10 * Math.sin(angle + Math.PI / 6));
-            ctx.closePath();
-            ctx.fill();
-          }
-        } else if (d.type === 'circle' && d.points.length >= 1 && d.radius) {
-          const center = mapToScreen(d.points[0][0], d.points[0][1]);
-          const rPx = d.radius * zoom;
-          ctx.beginPath();
-          ctx.arc(center.x, center.y, rPx, 0, Math.PI * 2);
-          ctx.fillStyle = `${d.color}15`;
-          ctx.fill();
-          ctx.setLineDash([4, 4]);
-          ctx.stroke();
-          ctx.setLineDash([]);
-        } else if (d.type === 'point' && d.points.length >= 1) {
-          const pt = mapToScreen(d.points[0][0], d.points[0][1]);
-          ctx.beginPath();
-          ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.stroke();
-          if (d.label) {
-            ctx.font = '10px "JetBrains Mono", monospace';
-            ctx.fillText(d.label, pt.x + 8, pt.y + 4);
-          }
-        }
-        ctx.restore();
-      });
-    }
-
-    // 5. In-Progress Tactical Drawing
-    if (drawingStart && drawingCurrent) {
-      const p1 = mapToScreen(drawingStart.x, drawingStart.y);
-      const p2 = mapToScreen(drawingCurrent.x, drawingCurrent.y);
-      ctx.save();
-      ctx.strokeStyle = drawingColor;
-      ctx.fillStyle = drawingColor;
-      ctx.lineWidth = 2;
-
-      if (interactionMode === 'draw_line') {
-        ctx.beginPath();
-        ctx.moveTo(p1.x, p1.y);
-        ctx.lineTo(p2.x, p2.y);
-        ctx.setLineDash([5, 3]);
-        ctx.stroke();
       } else if (interactionMode === 'draw_circle') {
-        const radiusMeters = Math.hypot(drawingCurrent.x - drawingStart.x, drawingCurrent.y - drawingStart.y);
-        ctx.beginPath();
-        ctx.arc(p1.x, p1.y, radiusMeters * zoom, 0, Math.PI * 2);
-        ctx.setLineDash([5, 3]);
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
-
-    // 6. Range Rings around Mortar Battery
-    if (showRings && mortar.x > 0 && mortar.y > 0) {
-      const mScr = mapToScreen(mortar.x, mortar.y);
-      const minRadiusPx = minRange * zoom;
-      const maxRadiusPx = maxRange * zoom;
-
-      // Minimum deadzone ring
-      ctx.beginPath();
-      ctx.arc(mScr.x, mScr.y, minRadiusPx, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.08)';
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(239, 68, 68, 0.7)';
-      ctx.lineWidth = 1.2;
-      ctx.setLineDash([3, 3]);
-      ctx.stroke();
-
-      // Maximum range envelope
-      ctx.beginPath();
-      ctx.arc(mScr.x, mScr.y, maxRadiusPx, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(16, 185, 129, 0.03)';
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(16, 185, 129, 0.6)';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([6, 4]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      if (maxRadiusPx > 40) {
-        ctx.font = '10px "JetBrains Mono", monospace';
-        ctx.fillStyle = 'rgba(52, 211, 153, 0.9)';
-        ctx.fillText(`MAX: ${maxRange}m`, mScr.x + 8, mScr.y - maxRadiusPx + 12);
-        ctx.fillStyle = 'rgba(248, 113, 113, 0.9)';
-        ctx.fillText(`MIN: ${minRange}m`, mScr.x + 8, mScr.y - minRadiusPx + 12);
-      }
-    }
-
-    // 7. Fire Mission Trajectory Line
-    if (mortar.x > 0 && mortar.y > 0 && target.x > 0 && target.y > 0) {
-      const mScr = mapToScreen(mortar.x, mortar.y);
-      const tScr = mapToScreen(target.x, target.y);
-
-      ctx.beginPath();
-      ctx.moveTo(mScr.x, mScr.y);
-      ctx.lineTo(tScr.x, tScr.y);
-      ctx.strokeStyle = solution?.inRange ? '#f59e0b' : '#ef4444';
-      ctx.lineWidth = 2.5;
-      ctx.setLineDash([8, 5]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      // Mid-point distance & bearing label tag
-      if (solution) {
-        const midX = (mScr.x + tScr.x) / 2;
-        const midY = (mScr.y + tScr.y) / 2;
-        const azText = `${solution.azimuthDeg.toFixed(1)}° (${solution.azimuthMilNato.toFixed(0)}mils)`;
-        const distText = `${solution.distance.toFixed(0)}m`;
-
-        ctx.font = '10px "JetBrains Mono", monospace';
-        const tagText = `${distText} · ${azText}`;
-        const tagWidth = ctx.measureText(tagText).width + 14;
-
-        ctx.fillStyle = 'rgba(18, 18, 20, 0.9)';
-        ctx.strokeStyle = solution.inRange ? '#d97706' : '#dc2626';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.roundRect(midX - tagWidth / 2, midY - 18, tagWidth, 20, 4);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.fillStyle = solution.inRange ? '#fef08a' : '#fca5a5';
-        ctx.textAlign = 'center';
-        ctx.fillText(tagText, midX, midY - 5);
-        ctx.textAlign = 'start';
-      }
-    }
-
-    // 8. Ruler Measure Tool
-    if (measureStart && measureEnd) {
-      const m1 = mapToScreen(measureStart.x, measureStart.y);
-      const m2 = mapToScreen(measureEnd.x, measureEnd.y);
-      const dist = Math.hypot(measureEnd.x - measureStart.x, measureEnd.y - measureStart.y);
-      const angle = (Math.atan2(measureEnd.x - measureStart.x, measureEnd.y - measureStart.y) * 180 / Math.PI + 360) % 360;
-
-      ctx.beginPath();
-      ctx.moveTo(m1.x, m1.y);
-      ctx.lineTo(m2.x, m2.y);
-      ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([4, 3]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      ctx.fillStyle = '#38bdf8';
-      ctx.beginPath();
-      ctx.arc(m1.x, m1.y, 4, 0, Math.PI * 2);
-      ctx.arc(m2.x, m2.y, 4, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.font = '10px "JetBrains Mono", monospace';
-      ctx.fillStyle = '#bae6fd';
-      ctx.fillText(`${dist.toFixed(0)}m / ${angle.toFixed(1)}°`, (m1.x + m2.x) / 2 + 5, (m1.y + m2.y) / 2 - 5);
-    }
-
-    // 9. Verified Landmarks and Locations (TASK 3)
-    if (showLabels && mapData.landmarks) {
-      const labelMinZoom = 0.035;
-      for (const lm of mapData.landmarks) {
-        const pt = mapToScreen(lm.x, lm.y);
-        if (pt.x < -40 || pt.x > displayWidth + 40 || pt.y < -40 || pt.y > displayHeight + 40) continue;
-
-        ctx.beginPath();
-        ctx.arc(pt.x, pt.y, lm.type === 'military' ? 4 : 3, 0, Math.PI * 2);
-        ctx.fillStyle = lm.type === 'military' ? '#f87171' : lm.type === 'industrial' ? '#fbbf24' : '#6ee7b7';
-        ctx.fill();
-        ctx.strokeStyle = '#000000';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-
-        if (zoom >= labelMinZoom) {
-          const labelText = lang === 'ar' && lm.nameAr ? lm.nameAr : lm.name;
-          ctx.font = '10px "Tajawal", "Plus Jakarta Sans", sans-serif';
-
-          ctx.strokeStyle = '#09090b';
-          ctx.lineWidth = 3;
-          ctx.strokeText(labelText, pt.x + 6, pt.y + 3);
-
-          ctx.fillStyle = '#f4f4f5';
-          ctx.fillText(labelText, pt.x + 6, pt.y + 3);
-
-          if (zoom >= 0.07) {
-            ctx.font = '8px "JetBrains Mono", monospace';
-            ctx.fillStyle = '#a1a1aa';
-            ctx.fillText(`${lm.alt}m`, pt.x + 6, pt.y + 13);
-          }
+        if (!drawingStart) {
+          setDrawingStart({ x, y });
+        } else {
+          const radiusMeters = Math.hypot(x - drawingStart.x, y - drawingStart.y);
+          onAddDrawing({
+            id: Math.random().toString(36).substring(2, 9),
+            mapId: mapData.id,
+            type: 'circle',
+            color: drawingColor,
+            points: [[drawingStart.x, drawingStart.y]],
+            radius: Math.max(50, radiusMeters),
+            timestamp: Date.now()
+          });
+          setDrawingStart(null);
         }
-      }
-    }
-
-    // 10. Battery Marker (🔴)
-    if (mortar.x > 0 && mortar.y > 0) {
-      const mScr = mapToScreen(mortar.x, mortar.y);
-      ctx.beginPath();
-      ctx.arc(mScr.x, mScr.y, 14, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.25)';
-      ctx.fill();
-
-      ctx.beginPath();
-      ctx.arc(mScr.x, mScr.y, 7, 0, Math.PI * 2);
-      ctx.fillStyle = '#ef4444';
-      ctx.fill();
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      ctx.font = 'bold 11px "JetBrains Mono", monospace';
-      ctx.strokeStyle = '#09090b';
-      ctx.lineWidth = 3;
-      ctx.strokeText(`🔴 ${t.mortarBattery}`, mScr.x + 10, mScr.y - 8);
-      ctx.fillStyle = '#fca5a5';
-      ctx.fillText(`🔴 ${t.mortarBattery}`, mScr.x + 10, mScr.y - 8);
-    }
-
-    // 11. Target Marker (🔵)
-    if (target.x > 0 && target.y > 0) {
-      const tScr = mapToScreen(target.x, target.y);
-
-      if (solution?.dispersionRadius) {
-        const dispPx = solution.dispersionRadius * zoom;
-        ctx.beginPath();
-        ctx.arc(tScr.x, tScr.y, Math.max(8, dispPx), 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(59, 130, 246, 0.15)';
-        ctx.fill();
-        ctx.strokeStyle = 'rgba(96, 165, 250, 0.6)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([2, 2]);
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-
-      ctx.beginPath();
-      ctx.arc(tScr.x, tScr.y, 14, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(59, 130, 246, 0.25)';
-      ctx.fill();
-
-      ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(tScr.x - 12, tScr.y);
-      ctx.lineTo(tScr.x + 12, tScr.y);
-      ctx.moveTo(tScr.x, tScr.y - 12);
-      ctx.lineTo(tScr.x + 12, tScr.y + 12);
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.arc(tScr.x, tScr.y, 6, 0, Math.PI * 2);
-      ctx.fillStyle = '#2563eb';
-      ctx.fill();
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      ctx.font = 'bold 11px "JetBrains Mono", monospace';
-      ctx.strokeStyle = '#09090b';
-      ctx.lineWidth = 3;
-      ctx.strokeText(`🔵 ${t.impactTarget}`, tScr.x + 10, tScr.y - 8);
-      ctx.fillStyle = '#93c5fd';
-      ctx.fillText(`🔵 ${t.impactTarget}`, tScr.x + 10, tScr.y - 8);
-    }
-
-    ctx.restore();
-  }, [
-    mapData,
-    mortar,
-    target,
-    solution,
-    zoom,
-    pan,
-    showGrid,
-    showLabels,
-    showRings,
-    measureStart,
-    measureEnd,
-    drawings,
-    drawingStart,
-    drawingCurrent,
-    drawingColor,
-    interactionMode,
-    mapImage,
-    imageLoadingStatus,
-    mapToScreen,
-    minRange,
-    maxRange,
-    lang,
-    t
-  ]);
-
-  // Mouse Handlers (Desktop)
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
-    const mapCoords = screenToMap(screenX, screenY);
-
-    if (e.button === 0) {
-      // Check marker dragging first
-      if (mortar.x > 0 && Math.hypot(screenX - mapToScreen(mortar.x, mortar.y).x, screenY - mapToScreen(mortar.x, mortar.y).y) < 22) {
-        setDragTarget('mortar');
-        setIsDragging(true);
-        setDragStart({ x: screenX, y: screenY });
-        return;
-      }
-
-      if (target.x > 0 && Math.hypot(screenX - mapToScreen(target.x, target.y).x, screenY - mapToScreen(target.x, target.y).y) < 22) {
-        setDragTarget('target');
-        setIsDragging(true);
-        setDragStart({ x: screenX, y: screenY });
-        return;
-      }
-
-      if (interactionMode === 'measure') {
-        setMeasureStart(mapCoords);
-        setMeasureEnd(mapCoords);
-        return;
-      }
-
-      if (interactionMode === 'draw_line' || interactionMode === 'draw_circle') {
-        setDrawingStart(mapCoords);
-        setDrawingCurrent(mapCoords);
-        return;
-      }
-
-      if (interactionMode === 'draw_point') {
+      } else if (interactionMode === 'draw_point') {
         onAddDrawing({
           id: Math.random().toString(36).substring(2, 9),
           mapId: mapData.id,
           type: 'point',
           color: drawingColor,
-          points: [[mapCoords.x, mapCoords.y]],
-          label: `${meterToGrid4(mapCoords.x)}-${meterToGrid4(mapCoords.y)}`,
+          points: [[x, y]],
+          label: `${meterToGrid4(x)}-${meterToGrid4(y)}`,
           timestamp: Date.now()
         });
-        return;
+      }
+    };
+
+    map.on('click', handleClick);
+    return () => {
+      map.off('click', handleClick);
+    };
+  }, [
+    mapData.id,
+    mapData.size,
+    interactionMode,
+    drawingStart,
+    drawingColor,
+    measurePointA,
+    onSetMortar,
+    onSetTarget,
+    onAddDrawing,
+    getGroundElevation
+  ]);
+
+  // 4. Update Battery (Mortar) and Target Markers
+  useEffect(() => {
+    const map = leafletMapRef.current;
+    if (!map) return;
+
+    // Mortar Marker
+    if (mortar.x > 0 && mortar.y > 0) {
+      const mortarLatLng = L.latLng(mortar.y, mortar.x);
+
+      if (!mortarMarkerRef.current) {
+        const icon = L.divIcon({
+          className: '',
+          html: `
+            <div class="relative flex items-center justify-center w-8 h-8 -translate-x-1/2 -translate-y-1/2 select-none pointer-events-auto">
+              <div class="absolute inset-0 rounded-full bg-red-500/30 animate-ping"></div>
+              <div class="w-6 h-6 rounded-full bg-red-600 border-2 border-white shadow-lg flex items-center justify-center text-[10px] font-bold text-white">
+                🔴
+              </div>
+            </div>
+          `,
+          iconSize: [0, 0]
+        });
+
+        const marker = L.marker(mortarLatLng, {
+          icon,
+          draggable: true,
+          zIndexOffset: 1000
+        }).addTo(map);
+
+        marker.on('drag', (e: L.LeafletEvent) => {
+          const m = e.target as L.Marker;
+          const pos = m.getLatLng();
+          const alt = getGroundElevation(pos.lng, pos.lat);
+          onSetMortar({ x: pos.lng, y: pos.lat, alt });
+        });
+
+        mortarMarkerRef.current = marker;
+      } else {
+        mortarMarkerRef.current.setLatLng(mortarLatLng);
+      }
+    } else if (mortarMarkerRef.current) {
+      map.removeLayer(mortarMarkerRef.current);
+      mortarMarkerRef.current = null;
+    }
+
+    // Target Marker
+    if (target.x > 0 && target.y > 0) {
+      const targetLatLng = L.latLng(target.y, target.x);
+
+      if (!targetMarkerRef.current) {
+        const icon = L.divIcon({
+          className: '',
+          html: `
+            <div class="relative flex items-center justify-center w-8 h-8 -translate-x-1/2 -translate-y-1/2 select-none pointer-events-auto">
+              <div class="absolute inset-0 rounded-full bg-blue-500/30 animate-ping"></div>
+              <div class="w-6 h-6 rounded-full bg-blue-600 border-2 border-white shadow-lg flex items-center justify-center text-xs font-bold text-white">
+                🎯
+              </div>
+            </div>
+          `,
+          iconSize: [0, 0]
+        });
+
+        const marker = L.marker(targetLatLng, {
+          icon,
+          draggable: true,
+          zIndexOffset: 1000
+        }).addTo(map);
+
+        marker.on('drag', (e: L.LeafletEvent) => {
+          const m = e.target as L.Marker;
+          const pos = m.getLatLng();
+          const alt = getGroundElevation(pos.lng, pos.lat);
+          onSetTarget({ x: pos.lng, y: pos.lat, alt });
+        });
+
+        targetMarkerRef.current = marker;
+      } else {
+        targetMarkerRef.current.setLatLng(targetLatLng);
+      }
+    } else if (targetMarkerRef.current) {
+      map.removeLayer(targetMarkerRef.current);
+      targetMarkerRef.current = null;
+    }
+  }, [mortar.x, mortar.y, target.x, target.y, onSetMortar, onSetTarget, getGroundElevation]);
+
+  // 5. Update Firing Trajectory and Range Rings
+  useEffect(() => {
+    const trajectoryGroup = trajectoryLayerGroupRef.current;
+    if (!trajectoryGroup) return;
+    trajectoryGroup.clearLayers();
+
+    // Range Rings around Mortar
+    if (showRings && mortar.x > 0 && mortar.y > 0) {
+      const mortarLatLng = L.latLng(mortar.y, mortar.x);
+
+      // Deadzone Min Range circle (Red)
+      L.circle(mortarLatLng, {
+        radius: minRange,
+        color: '#ef4444',
+        weight: 1.5,
+        dashArray: '4, 4',
+        fillColor: '#ef4444',
+        fillOpacity: 0.08
+      }).addTo(trajectoryGroup);
+
+      // Max Range Envelope circle (Emerald)
+      L.circle(mortarLatLng, {
+        radius: maxRange,
+        color: '#10b981',
+        weight: 2,
+        dashArray: '6, 4',
+        fillColor: '#10b981',
+        fillOpacity: 0.04
+      }).addTo(trajectoryGroup);
+    }
+
+    // Trajectory Line from Battery to Target
+    if (mortar.x > 0 && mortar.y > 0 && target.x > 0 && target.y > 0) {
+      const p1 = L.latLng(mortar.y, mortar.x);
+      const p2 = L.latLng(target.y, target.x);
+
+      const color = solution?.inRange ? '#f59e0b' : '#ef4444';
+
+      L.polyline([p1, p2], {
+        color: color,
+        weight: 3,
+        dashArray: '6, 6',
+        opacity: 0.95
+      }).addTo(trajectoryGroup);
+
+      // Mid-point marker with bearing & distance
+      if (solution) {
+        const midLat = (mortar.y + target.y) / 2;
+        const midLng = (mortar.x + target.x) / 2;
+        const tagText = `${solution.distance.toFixed(0)}m · ${solution.azimuthDeg.toFixed(1)}° (${solution.azimuthMilNato.toFixed(0)}mils)`;
+
+        const badgeIcon = L.divIcon({
+          className: '',
+          html: `
+            <div class="px-2 py-0.5 rounded bg-zinc-950/90 border border-amber-500/70 text-amber-300 font-mono text-[10px] font-bold whitespace-nowrap -translate-x-1/2 -translate-y-1/2 shadow-lg">
+              ${tagText}
+            </div>
+          `,
+          iconSize: [0, 0]
+        });
+
+        L.marker([midLat, midLng], { icon: badgeIcon, interactive: false }).addTo(trajectoryGroup);
       }
 
-      if (interactionMode === 'mortar') {
-        const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-        onSetMortar({ x: mapCoords.x, y: mapCoords.y, alt });
-        return;
+      // Dispersion ring at target
+      if (solution?.dispersionRadius) {
+        L.circle(p2, {
+          radius: solution.dispersionRadius,
+          color: '#60a5fa',
+          weight: 1.5,
+          dashArray: '2, 2',
+          fillColor: '#3b82f6',
+          fillOpacity: 0.15
+        }).addTo(trajectoryGroup);
       }
+    }
+  }, [mortar.x, mortar.y, target.x, target.y, minRange, maxRange, showRings, solution]);
 
-      if (interactionMode === 'target') {
-        const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-        onSetTarget({ x: mapCoords.x, y: mapCoords.y, alt });
-        return;
+  // 6. Tactical Military Grid Overlay (1000m & 100m)
+  useEffect(() => {
+    const gridGroup = gridLayerGroupRef.current;
+    if (!gridGroup) return;
+    gridGroup.clearLayers();
+
+    if (!showGrid) return;
+
+    const size = mapData.size;
+    const step1000 = 1000;
+    const step100 = 100;
+
+    // Minor 100m lines when zoomed in
+    if (currentZoom >= 2) {
+      for (let m = 0; m <= size; m += step100) {
+        if (m % 1000 === 0) continue;
+        L.polyline([[0, m], [size, m]], { color: 'rgba(255, 255, 255, 0.08)', weight: 0.5, interactive: false }).addTo(gridGroup);
+        L.polyline([[m, 0], [m, size]], { color: 'rgba(255, 255, 255, 0.08)', weight: 0.5, interactive: false }).addTo(gridGroup);
       }
-
-      // Default viewport drag
-      setIsDragging(true);
-      setDragTarget('viewport');
-      setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
-    } else if (e.button === 2) {
-      e.preventDefault();
-      const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-      onSetTarget({ x: mapCoords.x, y: mapCoords.y, alt });
-    }
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const screenX = e.clientX - rect.left;
-    const screenY = e.clientY - rect.top;
-    const mapCoords = screenToMap(screenX, screenY);
-    setCursorPos(mapCoords);
-
-    if (interactionMode === 'measure' && measureStart) {
-      setMeasureEnd(mapCoords);
-      return;
     }
 
-    if (drawingStart) {
-      setDrawingCurrent(mapCoords);
-      return;
-    }
+    // Major 1000m (1km) grid lines
+    for (let m = 0; m <= size; m += step1000) {
+      L.polyline([[0, m], [size, m]], { color: 'rgba(255, 255, 255, 0.22)', weight: 1.2, interactive: false }).addTo(gridGroup);
+      L.polyline([[m, 0], [m, size]], { color: 'rgba(255, 255, 255, 0.22)', weight: 1.2, interactive: false }).addTo(gridGroup);
 
-    if (!isDragging) return;
-
-    if (dragTarget === 'viewport') {
-      setPan({
-        x: e.clientX - dragStart.x,
-        y: e.clientY - dragStart.y
+      // Grid index numbers (00, 01, 02 ... 12)
+      const indexStr = String(Math.floor(m / 1000)).padStart(2, '0');
+      const labelBottom = L.divIcon({
+        className: '',
+        html: `<div class="text-[9px] font-mono text-zinc-300 font-bold -translate-x-1/2 -translate-y-1/2 bg-black/60 px-0.5 rounded">${indexStr}</div>`,
+        iconSize: [0, 0]
       });
-    } else if (dragTarget === 'mortar') {
-      const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-      onSetMortar({ x: mapCoords.x, y: mapCoords.y, alt });
-    } else if (dragTarget === 'target') {
-      const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-      onSetTarget({ x: mapCoords.x, y: mapCoords.y, alt });
+      L.marker([60, m + 50], { icon: labelBottom, interactive: false }).addTo(gridGroup);
+      L.marker([m + 50, 60], { icon: labelBottom, interactive: false }).addTo(gridGroup);
     }
-  };
+  }, [mapData.size, showGrid, currentZoom]);
 
-  const handleMouseUp = () => {
-    if (drawingStart && drawingCurrent) {
-      if (interactionMode === 'draw_line') {
-        onAddDrawing({
-          id: Math.random().toString(36).substring(2, 9),
-          mapId: mapData.id,
-          type: 'line',
-          color: drawingColor,
-          points: [[drawingStart.x, drawingStart.y], [drawingCurrent.x, drawingCurrent.y]],
-          timestamp: Date.now()
-        });
-      } else if (interactionMode === 'draw_circle') {
-        const radiusMeters = Math.hypot(drawingCurrent.x - drawingStart.x, drawingCurrent.y - drawingStart.y);
-        onAddDrawing({
-          id: Math.random().toString(36).substring(2, 9),
-          mapId: mapData.id,
-          type: 'circle',
-          color: drawingColor,
-          points: [[drawingStart.x, drawingStart.y]],
-          radius: radiusMeters,
-          timestamp: Date.now()
-        });
-      }
-      setDrawingStart(null);
-      setDrawingCurrent(null);
-    }
-    setIsDragging(false);
-    setDragTarget(null);
-  };
+  // 7. Verified Landmarks & Labels
+  useEffect(() => {
+    const lmGroup = landmarksLayerGroupRef.current;
+    if (!lmGroup) return;
+    lmGroup.clearLayers();
 
-  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const mouseScreenX = e.clientX - rect.left;
-    const mouseScreenY = e.clientY - rect.top;
+    if (!showLabels) return;
 
-    const factor = e.deltaY < 0 ? 1.2 : 1 / 1.2;
-    const newZoom = Math.max(0.015, Math.min(0.5, zoom * factor));
+    mapData.landmarks.forEach(lm => {
+      const latLng = L.latLng(lm.y, lm.x);
+      const labelText = lang === 'ar' && lm.nameAr ? lm.nameAr : lm.name;
 
-    const newPanX = mouseScreenX - (mouseScreenX - pan.x) * (newZoom / zoom);
-    const newPanY = mouseScreenY - (mouseScreenY - pan.y) * (newZoom / zoom);
+      const markerColor = lm.type === 'military' ? '#f87171' : lm.type === 'industrial' ? '#fbbf24' : '#6ee7b7';
 
-    setZoom(newZoom);
-    setPan({ x: newPanX, y: newPanY });
-  };
+      const lmIcon = L.divIcon({
+        className: '',
+        html: `
+          <div class="flex items-center gap-1.5 -translate-x-2 -translate-y-2 select-none pointer-events-auto">
+            <div class="w-3.5 h-3.5 rounded-full border border-black shadow" style="background-color: ${markerColor}"></div>
+            <div class="px-1.5 py-0.5 rounded bg-black/75 border border-zinc-700/60 text-zinc-100 font-sans text-[11px] font-semibold whitespace-nowrap shadow-md">
+              ${labelText} <span class="text-[9px] font-mono text-zinc-400">(${lm.alt}m)</span>
+            </div>
+          </div>
+        `,
+        iconSize: [0, 0]
+      });
 
-  // Mobile Touch Handlers: 1-finger pan, 2-finger pinch-to-zoom (TASK 5)
-  const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-
-    if (e.touches.length === 1) {
-      const touch = e.touches[0];
-      const screenX = touch.clientX - rect.left;
-      const screenY = touch.clientY - rect.top;
-      touchStartRef.current = { x: screenX, y: screenY };
-
-      const mapCoords = screenToMap(screenX, screenY);
-      setCursorPos(mapCoords);
-
-      // Check if touching near Mortar or Target
-      if (mortar.x > 0 && Math.hypot(screenX - mapToScreen(mortar.x, mortar.y).x, screenY - mapToScreen(mortar.x, mortar.y).y) < 28) {
-        setDragTarget('mortar');
-        setIsDragging(true);
-        setDragStart({ x: screenX, y: screenY });
-        return;
-      }
-      if (target.x > 0 && Math.hypot(screenX - mapToScreen(target.x, target.y).x, screenY - mapToScreen(target.x, target.y).y) < 28) {
-        setDragTarget('target');
-        setIsDragging(true);
-        setDragStart({ x: screenX, y: screenY });
-        return;
-      }
-
-      if (interactionMode === 'mortar') {
-        const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-        onSetMortar({ x: mapCoords.x, y: mapCoords.y, alt });
-        return;
-      }
-      if (interactionMode === 'target') {
-        const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-        onSetTarget({ x: mapCoords.x, y: mapCoords.y, alt });
-        return;
-      }
-
-      setIsDragging(true);
-      setDragTarget('viewport');
-      setDragStart({ x: touch.clientX - pan.x, y: touch.clientY - pan.y });
-    } else if (e.touches.length === 2) {
-      // Pinch to zoom initialization
-      const t1 = e.touches[0];
-      const t2 = e.touches[1];
-      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
-      touchPinchDistRef.current = dist;
-    }
-  };
-
-  const handleTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-
-    if (e.touches.length === 1 && isDragging) {
-      const touch = e.touches[0];
-      const screenX = touch.clientX - rect.left;
-      const screenY = touch.clientY - rect.top;
-      const mapCoords = screenToMap(screenX, screenY);
-      setCursorPos(mapCoords);
-
-      if (dragTarget === 'viewport') {
-        setPan({
-          x: touch.clientX - dragStart.x,
-          y: touch.clientY - dragStart.y
-        });
-      } else if (dragTarget === 'mortar') {
-        const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-        onSetMortar({ x: mapCoords.x, y: mapCoords.y, alt });
-      } else if (dragTarget === 'target') {
-        const alt = getGroundElevation(mapCoords.x, mapCoords.y);
-        onSetTarget({ x: mapCoords.x, y: mapCoords.y, alt });
-      }
-    } else if (e.touches.length === 2 && touchPinchDistRef.current) {
-      // Handle pinch zoom
-      const t1 = e.touches[0];
-      const t2 = e.touches[1];
-      const currentDist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
-      const factor = currentDist / touchPinchDistRef.current;
-
-      const midScreenX = (t1.clientX + t2.clientX) / 2 - rect.left;
-      const midScreenY = (t1.clientY + t2.clientY) / 2 - rect.top;
-
-      const newZoom = Math.max(0.015, Math.min(0.5, zoom * factor));
-      const newPanX = midScreenX - (midScreenX - pan.x) * (newZoom / zoom);
-      const newPanY = midScreenY - (midScreenY - pan.y) * (newZoom / zoom);
-
-      setZoom(newZoom);
-      setPan({ x: newPanX, y: newPanY });
-      touchPinchDistRef.current = currentDist;
-    }
-  };
-
-  const handleTouchEnd = () => {
-    setIsDragging(false);
-    setDragTarget(null);
-    touchStartRef.current = null;
-    touchPinchDistRef.current = null;
-  };
-
-  // Center on coordinates helper
-  const centerOnPoint = (mapX: number, mapY: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const centerX = canvas.clientWidth / 2;
-    const centerY = canvas.clientHeight / 2;
-    setPan({
-      x: centerX - mapX * zoom,
-      y: centerY - (mapData.size - mapY) * zoom
+      const m = L.marker(latLng, { icon: lmIcon }).addTo(lmGroup);
+      m.on('click', () => {
+        if (interactionMode === 'mortar') {
+          onSetMortar({ x: lm.x, y: lm.y, alt: lm.alt, name: lm.name });
+        } else {
+          onSetTarget({ x: lm.x, y: lm.y, alt: lm.alt, name: lm.name });
+        }
+      });
     });
+  }, [mapData.landmarks, showLabels, lang, interactionMode, onSetMortar, onSetTarget]);
+
+  // 8. Saved Tactical Drawings (TASK 4)
+  useEffect(() => {
+    const drawGroup = drawingsLayerGroupRef.current;
+    if (!drawGroup) return;
+    drawGroup.clearLayers();
+
+    drawings.forEach(d => {
+      if (d.mapId !== mapData.id) return;
+
+      if (d.type === 'line' && d.points.length >= 2) {
+        const latLngs = d.points.map(p => L.latLng(p[1], p[0]));
+        L.polyline(latLngs, { color: d.color, weight: 2.5 }).addTo(drawGroup);
+      } else if (d.type === 'circle' && d.points.length >= 1 && d.radius) {
+        const center = L.latLng(d.points[0][1], d.points[0][0]);
+        L.circle(center, {
+          radius: d.radius,
+          color: d.color,
+          weight: 1.5,
+          dashArray: '4, 4',
+          fillColor: d.color,
+          fillOpacity: 0.12
+        }).addTo(drawGroup);
+      } else if (d.type === 'point' && d.points.length >= 1) {
+        const pt = L.latLng(d.points[0][1], d.points[0][0]);
+        const pointIcon = L.divIcon({
+          className: '',
+          html: `
+            <div class="flex items-center gap-1 -translate-x-1.5 -translate-y-1.5">
+              <div class="w-3 h-3 rounded-full border border-white" style="background-color: ${d.color}"></div>
+              ${d.label ? `<div class="px-1 bg-black/80 text-[10px] text-zinc-200 rounded font-mono">${d.label}</div>` : ''}
+            </div>
+          `,
+          iconSize: [0, 0]
+        });
+        L.marker(pt, { icon: pointIcon, interactive: false }).addTo(drawGroup);
+      }
+    });
+  }, [drawings, mapData.id]);
+
+  // 9. Measurement Ruler Tool
+  useEffect(() => {
+    const rulerGroup = rulerLayerGroupRef.current;
+    if (!rulerGroup) return;
+    rulerGroup.clearLayers();
+
+    if (measurePointA && measurePointB) {
+      const p1 = L.latLng(measurePointA.y, measurePointA.x);
+      const p2 = L.latLng(measurePointB.y, measurePointB.x);
+      const dist = Math.hypot(measurePointB.x - measurePointA.x, measurePointB.y - measurePointA.y);
+      const angle = (Math.atan2(measurePointB.x - measurePointA.x, measurePointB.y - measurePointA.y) * 180 / Math.PI + 360) % 360;
+
+      L.polyline([p1, p2], { color: '#38bdf8', weight: 2, dashArray: '4, 4' }).addTo(rulerGroup);
+
+      const midLat = (measurePointA.y + measurePointB.y) / 2;
+      const midLng = (measurePointA.x + measurePointB.x) / 2;
+
+      const badge = L.divIcon({
+        className: '',
+        html: `
+          <div class="px-2 py-0.5 rounded bg-sky-950/90 border border-sky-400 text-sky-200 font-mono text-[10px] font-bold whitespace-nowrap -translate-x-1/2 -translate-y-1/2 shadow-lg">
+            ${dist.toFixed(0)}m · ${angle.toFixed(1)}°
+          </div>
+        `,
+        iconSize: [0, 0]
+      });
+
+      L.marker([midLat, midLng], { icon: badge, interactive: false }).addTo(rulerGroup);
+    }
+  }, [measurePointA, measurePointB]);
+
+  // Centering helpers
+  const handleCenterMortar = () => {
+    const map = leafletMapRef.current;
+    if (!map || mortar.x <= 0) return;
+    map.setView(L.latLng(mortar.y, mortar.x), Math.max(2, map.getZoom()));
+  };
+
+  const handleCenterTarget = () => {
+    const map = leafletMapRef.current;
+    if (!map || target.x <= 0) return;
+    map.setView(L.latLng(target.y, target.x), Math.max(2, map.getZoom()));
+  };
+
+  const handleFitExtents = () => {
+    const map = leafletMapRef.current;
+    if (!map) return;
+    const bounds = L.latLngBounds(L.latLng(0, 0), L.latLng(mapData.size, mapData.size));
+    map.fitBounds(bounds);
   };
 
   return (
-    <div className="relative w-full h-[65vh] min-h-[380px] lg:h-[620px] bg-zinc-950 rounded-xl overflow-hidden border border-zinc-800 shadow-2xl flex flex-col">
-      {/* Top Map Toolbar (Responsive) */}
-      <div className="absolute top-2 left-2 right-2 z-20 flex flex-wrap items-center justify-between gap-1.5 pointer-events-none">
+    <div className="relative w-full h-[65vh] min-h-[420px] lg:h-[630px] bg-zinc-950 rounded-xl overflow-hidden border border-zinc-800 shadow-2xl flex flex-col">
+      {/* Top Map Toolbar */}
+      <div className="absolute top-2 left-2 right-2 z-500 flex flex-wrap items-center justify-between gap-1.5 pointer-events-none">
         {/* Interaction Mode Buttons */}
-        <div className="flex items-center gap-1 bg-zinc-900/90 border border-zinc-700/80 p-1 rounded-lg shadow-md pointer-events-auto backdrop-blur-xs">
+        <div className="flex items-center gap-1 bg-zinc-900/95 border border-zinc-700/80 p-1 rounded-lg shadow-xl pointer-events-auto backdrop-blur-md">
           <button
             onClick={() => onSelectInteractionMode('mortar')}
-            className={`min-h-[36px] px-2.5 py-1 text-xs font-semibold rounded flex items-center gap-1.5 transition-colors cursor-pointer ${
+            className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded flex items-center gap-1.5 transition-colors cursor-pointer ${
               interactionMode === 'mortar'
                 ? 'bg-red-600 text-white shadow-xs'
                 : 'text-zinc-300 hover:text-white hover:bg-zinc-800'
             }`}
           >
-            <span className="w-2 h-2 rounded-full bg-red-400"></span>
+            <span className="w-2.5 h-2.5 rounded-full bg-red-400"></span>
             {t.clickToSetMortar}
           </button>
           <button
             onClick={() => onSelectInteractionMode('target')}
-            className={`min-h-[36px] px-2.5 py-1 text-xs font-semibold rounded flex items-center gap-1.5 transition-colors cursor-pointer ${
+            className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded flex items-center gap-1.5 transition-colors cursor-pointer ${
               interactionMode === 'target'
                 ? 'bg-blue-600 text-white shadow-xs'
                 : 'text-zinc-300 hover:text-white hover:bg-zinc-800'
             }`}
           >
-            <span className="w-2 h-2 rounded-full bg-blue-400"></span>
+            <span className="w-2.5 h-2.5 rounded-full bg-blue-400"></span>
             {t.clickToSetTarget}
           </button>
           <button
             onClick={() => {
               if (interactionMode === 'measure') {
                 onSelectInteractionMode('view');
-                setMeasureStart(null);
-                setMeasureEnd(null);
+                setMeasurePointA(null);
+                setMeasurePointB(null);
               } else {
                 onSelectInteractionMode('measure');
               }
             }}
-            className={`min-h-[36px] px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
+            className={`min-h-[38px] px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
               interactionMode === 'measure'
                 ? 'bg-sky-600 text-white'
                 : 'text-zinc-300 hover:text-white hover:bg-zinc-800'
@@ -913,11 +704,11 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           </button>
         </div>
 
-        {/* Tactical Drawing Tools Drawer Button */}
-        <div className="flex items-center gap-1 bg-zinc-900/90 border border-zinc-700/80 p-1 rounded-lg shadow-md pointer-events-auto backdrop-blur-xs text-xs">
+        {/* Tactical Drawing Tools */}
+        <div className="flex items-center gap-1 bg-zinc-900/95 border border-zinc-700/80 p-1 rounded-lg shadow-xl pointer-events-auto backdrop-blur-md text-xs">
           <button
             onClick={() => onSelectInteractionMode(interactionMode === 'draw_line' ? 'view' : 'draw_line')}
-            className={`min-h-[36px] px-2 py-1 rounded transition-colors cursor-pointer ${
+            className={`min-h-[38px] px-2 py-1 rounded transition-colors cursor-pointer ${
               interactionMode === 'draw_line' ? 'bg-amber-600 text-white font-semibold' : 'text-zinc-300 hover:bg-zinc-800'
             }`}
             title={t.drawLine}
@@ -926,7 +717,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           </button>
           <button
             onClick={() => onSelectInteractionMode(interactionMode === 'draw_circle' ? 'view' : 'draw_circle')}
-            className={`min-h-[36px] px-2 py-1 rounded transition-colors cursor-pointer ${
+            className={`min-h-[38px] px-2 py-1 rounded transition-colors cursor-pointer ${
               interactionMode === 'draw_circle' ? 'bg-amber-600 text-white font-semibold' : 'text-zinc-300 hover:bg-zinc-800'
             }`}
             title={t.drawCircle}
@@ -935,7 +726,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           </button>
           <button
             onClick={() => onSelectInteractionMode(interactionMode === 'draw_point' ? 'view' : 'draw_point')}
-            className={`min-h-[36px] px-2 py-1 rounded transition-colors cursor-pointer ${
+            className={`min-h-[38px] px-2 py-1 rounded transition-colors cursor-pointer ${
               interactionMode === 'draw_point' ? 'bg-amber-600 text-white font-semibold' : 'text-zinc-300 hover:bg-zinc-800'
             }`}
             title={t.drawPoint}
@@ -958,7 +749,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
           {drawings.length > 0 && (
             <button
               onClick={onClearDrawings}
-              className="px-1.5 py-1 text-[10px] text-zinc-400 hover:text-red-400 cursor-pointer"
+              className="px-1.5 py-1 text-xs text-zinc-400 hover:text-red-400 cursor-pointer"
               title={t.clearDrawings}
             >
               🗑️
@@ -967,51 +758,51 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         </div>
 
         {/* View Controls & Diagnostics (TASK 6) */}
-        <div className="flex items-center gap-1 bg-zinc-900/90 border border-zinc-700/80 p-1 rounded-lg shadow-md pointer-events-auto backdrop-blur-xs text-xs">
+        <div className="flex items-center gap-1 bg-zinc-900/95 border border-zinc-700/80 p-1 rounded-lg shadow-xl pointer-events-auto backdrop-blur-md text-xs">
           <button
             onClick={() => setShowGrid(s => !s)}
-            className={`min-h-[36px] px-2 py-1 rounded transition-colors cursor-pointer ${showGrid ? 'bg-zinc-700 text-white' : 'text-zinc-400'}`}
+            className={`min-h-[38px] px-2 py-1 rounded transition-colors cursor-pointer ${showGrid ? 'bg-zinc-700 text-white' : 'text-zinc-400'}`}
           >
             {t.toggleGrid}
           </button>
           <button
             onClick={() => setShowLabels(s => !s)}
-            className={`min-h-[36px] px-2 py-1 rounded transition-colors cursor-pointer ${showLabels ? 'bg-zinc-700 text-white' : 'text-zinc-400'}`}
+            className={`min-h-[38px] px-2 py-1 rounded transition-colors cursor-pointer ${showLabels ? 'bg-zinc-700 text-white' : 'text-zinc-400'}`}
           >
             {t.toggleLabels}
           </button>
           <button
             onClick={() => setShowRings(s => !s)}
-            className={`min-h-[36px] px-2 py-1 rounded transition-colors cursor-pointer ${showRings ? 'bg-zinc-700 text-white' : 'text-zinc-400'}`}
+            className={`min-h-[38px] px-2 py-1 rounded transition-colors cursor-pointer ${showRings ? 'bg-zinc-700 text-white' : 'text-zinc-400'}`}
           >
             {t.toggleRings}
           </button>
           <span className="text-zinc-700">|</span>
           <button
-            onClick={() => mortar.x && centerOnPoint(mortar.x, mortar.y)}
-            className="min-h-[36px] px-2 py-1 text-zinc-300 hover:text-white hover:bg-zinc-800 rounded cursor-pointer"
+            onClick={handleCenterMortar}
+            className="min-h-[38px] px-2 py-1 text-zinc-300 hover:text-white hover:bg-zinc-800 rounded cursor-pointer"
             title={t.centerMortar}
           >
             🎯
           </button>
           <button
-            onClick={() => target.x && centerOnPoint(target.x, target.y)}
-            className="min-h-[36px] px-2 py-1 text-zinc-300 hover:text-white hover:bg-zinc-800 rounded cursor-pointer"
+            onClick={handleCenterTarget}
+            className="min-h-[38px] px-2 py-1 text-zinc-300 hover:text-white hover:bg-zinc-800 rounded cursor-pointer"
             title={t.centerTarget}
           >
             📍
           </button>
           <button
-            onClick={fitMap}
-            className="min-h-[36px] px-2 py-1 text-zinc-300 hover:text-white hover:bg-zinc-800 rounded cursor-pointer font-bold"
+            onClick={handleFitExtents}
+            className="min-h-[38px] px-2 py-1 text-zinc-300 hover:text-white hover:bg-zinc-800 rounded cursor-pointer font-bold"
             title={t.fitMap}
           >
             ⛶
           </button>
           <button
             onClick={() => setShowDiagnostics(s => !s)}
-            className={`min-h-[36px] px-2 py-1 rounded transition-colors cursor-pointer ${
-              imageLoadingStatus === 'error' ? 'bg-red-900 text-red-200' : showDiagnostics ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
+            className={`min-h-[38px] px-2 py-1 rounded transition-colors cursor-pointer ${
+              tileLoadingStatus === 'error' ? 'bg-red-900 text-red-200' : showDiagnostics ? 'bg-zinc-700 text-white' : 'text-zinc-400 hover:text-zinc-200'
             }`}
             title={t.toggleDiagnostics}
           >
@@ -1020,60 +811,37 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
         </div>
       </div>
 
-      {/* Map Canvas (Desktop Mouse & Mobile Touch Enabled) */}
-      <canvas
-        ref={canvasRef}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        onContextMenu={e => e.preventDefault()}
+      {/* Leaflet Map DOM Container */}
+      <div
+        ref={mapContainerRef}
+        className="w-full h-full bg-zinc-950 select-none z-0"
         style={{ touchAction: 'none' }}
-        className={`w-full h-full block select-none ${
-          interactionMode === 'mortar' || interactionMode === 'target'
-            ? 'cursor-crosshair'
-            : interactionMode.startsWith('draw_')
-            ? 'cursor-crosshair'
-            : isDragging
-            ? 'cursor-grabbing'
-            : 'cursor-grab'
-        }`}
       />
 
-      {/* Loading Indicator Overlay */}
-      {imageLoadingStatus === 'loading' && (
-        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-30 bg-zinc-900/90 border border-emerald-500/50 text-emerald-300 px-4 py-2 rounded-lg text-xs flex items-center gap-2 shadow-xl backdrop-blur-xs">
+      {/* Loading Overlay Badge */}
+      {tileLoadingStatus === 'loading' && (
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-500 bg-zinc-900/95 border border-emerald-500/60 text-emerald-300 px-4 py-2 rounded-lg text-xs flex items-center gap-2 shadow-2xl backdrop-blur-md">
           <div className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
           <span>{t.mapStatusLoading}</span>
         </div>
       )}
 
-      {/* Error State Banner with Retry and Official Link (TASK 1 & TASK 2) */}
-      {imageLoadingStatus === 'error' && (
-        <div className="absolute top-14 left-4 right-4 z-30 bg-red-950/95 border border-red-500 text-red-200 p-3 rounded-lg shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-3 text-xs backdrop-blur-xs">
+      {/* Error Banner with Retry and Official Link */}
+      {tileLoadingStatus === 'error' && (
+        <div className="absolute top-14 left-4 right-4 z-500 bg-red-950/95 border border-red-500 text-red-200 p-3 rounded-lg shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-3 text-xs backdrop-blur-md">
           <div className="flex items-center gap-2">
             <span className="text-base">⚠️</span>
             <div>
               <div className="font-bold">{t.mapStatusError}</div>
-              <div className="text-[11px] text-red-300 mt-0.5">{imageErrorMessage}</div>
+              <div className="text-[11px] text-red-300 mt-0.5">{lastErrorMessage || 'Tile server network issue.'}</div>
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <button
-              onClick={() => setRetryCounter(c => c + 1)}
-              className="px-3 py-1.5 bg-red-800 hover:bg-red-700 text-white font-medium rounded transition-colors cursor-pointer text-xs"
-            >
-              {t.mapRetry}
-            </button>
             <a
               href={mapData.officialUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-100 font-medium rounded transition-colors text-xs flex items-center gap-1"
+              className="min-h-[36px] px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-100 font-medium rounded transition-colors text-xs flex items-center gap-1"
             >
               <span>{t.openOfficialMap}</span>
               <span>↗</span>
@@ -1083,16 +851,16 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       )}
 
       {/* Zoom Controls (Bottom Right) */}
-      <div className="absolute bottom-10 right-3 z-10 flex flex-col gap-1 bg-zinc-900/90 border border-zinc-700/80 rounded-lg shadow-lg p-1 backdrop-blur-xs">
+      <div className="absolute bottom-10 right-3 z-500 flex flex-col gap-1 bg-zinc-900/95 border border-zinc-700/80 rounded-lg shadow-xl p-1 backdrop-blur-md">
         <button
-          onClick={() => setZoom(z => Math.min(0.5, z * 1.25))}
+          onClick={() => leafletMapRef.current?.zoomIn()}
           className="w-9 h-9 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-100 flex items-center justify-center font-bold text-lg cursor-pointer"
           title="Zoom In"
         >
           +
         </button>
         <button
-          onClick={() => setZoom(z => Math.max(0.015, z / 1.25))}
+          onClick={() => leafletMapRef.current?.zoomOut()}
           className="w-9 h-9 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-100 flex items-center justify-center font-bold text-lg cursor-pointer"
           title="Zoom Out"
         >
@@ -1101,7 +869,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
       </div>
 
       {/* Coordinate Status Bar (Bottom Left) */}
-      <div className="absolute bottom-2 left-2 z-10 bg-zinc-950/85 border border-zinc-800 px-3 py-1 rounded-md text-[11px] font-mono text-zinc-300 shadow-md flex items-center gap-3 backdrop-blur-xs">
+      <div className="absolute bottom-2 left-2 z-500 bg-zinc-950/90 border border-zinc-800 px-3 py-1 rounded-md text-[11px] font-mono text-zinc-300 shadow-md flex items-center gap-3 backdrop-blur-md">
         {cursorPos ? (
           <>
             <span>{t.cursorCoords} <strong className="text-emerald-400">{meterToGrid4(cursorPos.x)}-{meterToGrid4(cursorPos.y)}</strong></span>
@@ -1117,7 +885,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
 
       {/* Map Diagnostics Panel (TASK 6) */}
       {showDiagnostics && (
-        <div className="absolute inset-x-2 bottom-12 z-30 bg-zinc-900/95 border border-zinc-700 rounded-lg p-3 text-xs text-zinc-200 shadow-2xl backdrop-blur-md max-h-60 overflow-y-auto">
+        <div className="absolute inset-x-2 bottom-12 z-600 bg-zinc-900/95 border border-zinc-700 rounded-lg p-3 text-xs text-zinc-200 shadow-2xl backdrop-blur-md max-h-64 overflow-y-auto">
           <div className="flex items-center justify-between mb-2 border-b border-zinc-800 pb-1.5">
             <div className="font-bold uppercase tracking-wide text-zinc-100 flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-blue-400" />
@@ -1140,18 +908,18 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
             </div>
             <div>
               <span className="text-zinc-400">{t.mapTilesLoaded}</span>{' '}
-              <strong className={imageLoadingStatus === 'loaded' ? 'text-emerald-400' : imageLoadingStatus === 'loading' ? 'text-amber-400' : 'text-red-400'}>
-                {imageLoadingStatus === 'loaded' ? t.mapStatusLoaded : imageLoadingStatus === 'loading' ? t.mapStatusLoading : t.mapStatusError}
+              <strong className={tileLoadingStatus === 'loaded' ? 'text-emerald-400' : tileLoadingStatus === 'loading' ? 'text-amber-400' : 'text-red-400'}>
+                {tileLoadingStatus === 'loaded' ? t.mapStatusLoaded : tileLoadingStatus === 'loading' ? t.mapStatusLoading : t.mapStatusError}
               </strong>
             </div>
             <div>
-              <span className="text-zinc-400">Current Zoom:</span> <strong className="text-zinc-100">{(zoom * 1000).toFixed(1)} px/km</strong>
+              <span className="text-zinc-400">Leaflet Zoom Level:</span> <strong className="text-zinc-100">LOD {mapData.maxZoomLOD - currentZoom} (Leaflet {currentZoom})</strong>
             </div>
-            <div className="col-span-full">
-              <span className="text-zinc-400">{t.sourceEndpoint}</span>{' '}
-              <a href={mapData.overviewUrl} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline break-all">
-                {mapData.overviewUrl}
-              </a>
+            <div>
+              <span className="text-zinc-400">Loaded Tiles:</span> <strong className="text-emerald-400">{tilesLoadedCount}</strong>
+            </div>
+            <div>
+              <span className="text-zinc-400">Tile Errors:</span> <strong className={tilesErrorCount > 0 ? 'text-red-400' : 'text-zinc-400'}>{tilesErrorCount}</strong>
             </div>
             <div className="col-span-full">
               <span className="text-zinc-400">Tile Pattern:</span>{' '}
@@ -1168,7 +936,7 @@ export const TacticalMap: React.FC<TacticalMapProps> = ({
               href={mapData.officialUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded font-medium text-xs flex items-center gap-1.5 transition-colors"
+              className="min-h-[36px] px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded font-medium text-xs flex items-center gap-1.5 transition-colors"
             >
               <span>{t.openOfficialMap}</span>
               <span>↗</span>
