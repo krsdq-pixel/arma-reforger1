@@ -1,0 +1,7 @@
+{
+  "name": "Arma Reforger Mortar Calculator",
+  "description": "Tactical ballistic mortar calculator and interactive military grid map for Arma Reforger (Everon & Arland) with NATO & Warsaw Pact mils, splash countdown, elevation compensation, and bilingual support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
