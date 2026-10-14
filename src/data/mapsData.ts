@@ -8,8 +8,11 @@ export interface MapData {
   defaultCenter: [number, number];
   overviewUrl: string; // Verified real overview image
   tileTemplateUrl: string; // Verified tile template URL
-  minZoomLOD: number;
-  maxZoomLOD: number;
+  serverMaxZoom: number; // Base server zoom level (5 for all maps)
+  nativeMaxZoom: number; // Highest zoom level with real tiles available
+  maxZoom: number; // Max allowable user zoom (overscaled smoothly)
+  minZoom: number; // Overview zoom level (0)
+  initialZoom: number; // Initial zoom level for optimal viewing
   officialUrl: string;
   sourceCredit: string;
   landmarks: Landmark[];
@@ -97,8 +100,11 @@ export const MAPS: Record<MapId, MapData> = {
     defaultCenter: [6400, 6400],
     overviewUrl: 'https://reforger.recoil.org/everon-512.jpg',
     tileTemplateUrl: 'https://reforger.recoil.org/map-tiles/everon/{z}/{x}/{y}/tile.jpg',
-    minZoomLOD: 1,
-    maxZoomLOD: 5,
+    serverMaxZoom: 5,
+    nativeMaxZoom: 5,
+    maxZoom: 7,
+    minZoom: 0,
+    initialZoom: 0,
     officialUrl: 'https://reforger.recoil.org/everon/',
     sourceCredit: 'EnfusionMapMaker by Nick Ludlam / Bohemia Interactive',
     landmarks: EVERON_LOCATIONS
@@ -111,8 +117,11 @@ export const MAPS: Record<MapId, MapData> = {
     defaultCenter: [2000, 2000],
     overviewUrl: 'https://reforger.recoil.org/arland-512.jpg',
     tileTemplateUrl: 'https://reforger.recoil.org/map-tiles/arland/{z}/{x}/{y}/tile.jpg',
-    minZoomLOD: 1,
-    maxZoomLOD: 4,
+    serverMaxZoom: 5,
+    nativeMaxZoom: 5,
+    maxZoom: 7,
+    minZoom: 0,
+    initialZoom: 1,
     officialUrl: 'https://reforger.recoil.org/arland/',
     sourceCredit: 'EnfusionMapMaker by Nick Ludlam / Bohemia Interactive',
     landmarks: ARLAND_LOCATIONS
@@ -125,8 +134,11 @@ export const MAPS: Record<MapId, MapData> = {
     defaultCenter: [7000, 7000],
     overviewUrl: 'https://reforger.recoil.org/kolguyev-512.jpg',
     tileTemplateUrl: 'https://reforger.recoil.org/map-tiles/cain/{z}/{x}/{y}/tile.jpg',
-    minZoomLOD: 2,
-    maxZoomLOD: 5,
+    serverMaxZoom: 5,
+    nativeMaxZoom: 4,
+    maxZoom: 7,
+    minZoom: 0,
+    initialZoom: 0,
     officialUrl: 'https://reforger.recoil.org/kolguyev/',
     sourceCredit: 'EnfusionMapMaker by Nick Ludlam / Bohemia Interactive',
     landmarks: KOLGUYEV_LOCATIONS

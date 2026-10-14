@@ -16,6 +16,17 @@
   }
 }
 
+/* Tactical Leaflet Map styling */
+.leaflet-container {
+  background-color: #12232c !important; /* Arma Reforger deep sea ocean color */
+  outline: none;
+  font-family: inherit;
+}
+
+.leaflet-tile {
+  image-rendering: auto;
+}
+
 /* Tactical military scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
